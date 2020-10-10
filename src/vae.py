@@ -39,7 +39,7 @@ class Model_small(nn.Module):
     def decode(self, z):
         h3 = F.relu(self.fc3(z))
         h3 = F.relu(self.fc3a(h3))
-        return self.fc4(h3)
+        return torch.sigmoid(self.fc4(h3))
 
     def forward(self, x):
         mu, logvar = self.encode(x)
@@ -65,7 +65,8 @@ class VAE_small:
 
     # loss function defined as sum of KL divergence and reconstruction loss
     def loss_function(self,recon_x, x, mu, logvar):
-        recon_loss = F.mse_loss(recon_x, x)
+#         print(torch.min(recon_x), torch.max(recon_x), torch.min(x), torch.max(x))
+        recon_loss = F.mse_loss(recon_x, x, reduction='sum')
         kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         return recon_loss + kld
 
