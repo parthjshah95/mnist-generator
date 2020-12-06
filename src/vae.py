@@ -12,7 +12,9 @@ from tqdm import tqdm
 
 
 class Model(nn.Module):
-    def __init__(self):
+    def __init__(self, hardsigmoid, cond):
+        self.hardsigmoid = hardsigmoid
+        self.cond = cond
         super().__init__()
         # 28x28x1
         self.conv1 = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3, stride=1, padding=1)
@@ -31,6 +33,7 @@ class Model(nn.Module):
         # 100 (var)
         
         self.fc2 = nn.Linear(100, 3*3*16)
+        self.fc2_cond = nn.Linear(110, 3*3*16)
         # 3x3x16
         self.deconv1 = nn.ConvTranspose2d(in_channels=16, out_channels=16, kernel_size=3, stride=1, padding=0, output_padding=0)
         # 5x5x16
@@ -67,29 +70,38 @@ class Model(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps*std
 
-    def decode(self, z):
-        z = F.leaky_relu(self.fc2(z))
+    def decode(self, z, lb):
+        if self.cond:
+            z = torch.cat([z, lb], dim=-1)
+            z = F.leaky_relu(self.fc2_cond(z))
+        else:
+            z = F.leaky_relu(self.fc2(z))
         z = z.view(-1, 16, 3, 3)
         z = F.leaky_relu(self.deconv1(z))
         z = F.leaky_relu(self.batchnorm2(self.deconv2(z)))
         z = F.leaky_relu(self.deconv3(z))
         z = F.leaky_relu(self.batchnorm3(self.deconv4(z)))
         z = F.leaky_relu(self.deconv5(z))
-        z = F.hardsigmoid(self.deconv6(z))
-        z = F.pad(z, [0,1,0,1])
-        z = self.lastconv(z)
+        if self.hardsigmoid:
+            z = F.hardsigmoid(self.deconv6(z))
+            z = F.pad(z, [0,1,0,1])
+#             z = self.lastconv(z)
+        else:
+            z = F.sigmoid(self.deconv6(z))
+            z = F.pad(z, [0,1,0,1])
         return z
 
-    def forward(self, x):
+    def forward(self, x, lb):
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        return self.decode(z), mu, logvar
+        return self.decode(z, lb), mu, logvar
 
     
     
 class VAE:
-    def __init__(self, device):
-        self.model = Model().to(device)
+    def __init__(self, device, hardsigmoid=True, conditional=False):
+        self.conditional = conditional
+        self.model = Model(hardsigmoid, conditional).to(device)
         self.device = device
         # initialize optimizer
         # adam optimizer is used instead of adagrad for better convergence
@@ -121,6 +133,7 @@ class VAE:
         mov_av_loss = 300
         pbar = tqdm(total=max_epochs)
         while True:
+            torch.cuda.empty_cache()
             pbar.update(1)
             if epoch >= max_epochs:
                 break
@@ -128,10 +141,14 @@ class VAE:
                 break
             epoch += 1
             batch_loss = []
-            for data, _ in (train_data):
+            for data, label in (train_data):
+                lb = torch.zeros([label.shape[0], 10])
+                for i in range(label.shape[0]):
+                    lb[i, label[i]] = 1
                 data = data.to(self.device)
+                lb = lb.to(self.device)
                 self.optimizer.zero_grad()
-                recon_batch, mu, logvar = self.model(data)
+                recon_batch, mu, logvar = self.model(data, lb)
                 loss = self.loss_function(recon_batch, data, mu, logvar)
                 loss.backward()
                 self.optimizer.step()
@@ -142,9 +159,13 @@ class VAE:
             batch_loss_test = []
             if test_data:
                 with torch.no_grad():
-                    for data,_ in test_data:
+                    for data, label in test_data:
+                        lb = torch.zeros([label.shape[0], 10])
+                        for i in range(label.shape[0]):
+                            lb[i, label[i]] = 1
                         data = data.to(self.device)
-                        recon_batch, mu, logvar = self.model(data)
+                        lb = lb.to(self.device)
+                        recon_batch, mu, logvar = self.model(data, lb)
                         loss = self.loss_function(recon_batch, data, mu, logvar)                   
                         batch_loss_test.append(loss.cpu().numpy())
                     test_loss_list.append(np.mean(batch_loss_test))
@@ -158,39 +179,49 @@ class VAE:
         self.model.eval()
         reconstructions = []
         with torch.no_grad():
-            for data, _ in (test_data):
+            for data, label in (test_data):
+                lb = torch.zeros([label.shape[0], 10])
+                for i in range(label.shape[0]):
+                    lb[i, label[i]] = 1
                 data = data.to(self.device)
-                recon_batch, mu, logvar = self.model(data)
+                lb = lb.to(self.device)
+                recon_batch, mu, logvar = self.model(data, lb)
                 reconstructions.append(recon_batch.cpu().numpy())
         return reconstructions
     
     def encode(self, enc_data):
         self.model.eval()
         latent_vecs = []
+        labels = []
         self.model.eval()
         with torch.no_grad():
-            for data, _ in (enc_data):
+            for data, label in (enc_data):
+                lb = torch.zeros([label.shape[0], 10])
+                for i in range(label.shape[0]):
+                    lb[i, label[i]] = 1
                 data = data.to(self.device)
+                lb = lb.to(self.device)
                 mu, logvar = self.model.encode(data)
-                latent = torch.stack([mu, logvar]).permute(1,0,2)
+                latent = torch.stack([mu, logvar]).permute(1,0,2)                
                 latent_vecs.append(latent)
-        return torch.cat(latent_vecs)
+                if self.conditional:
+                    labels.append(lb)
+        if self.conditional:
+            return torch.cat(latent_vecs), torch.cat(labels)
+        return torch.cat(latent_vecs) 
     
-    def decode(self, latent_vectors):
+    def decode(self, latent_vectors, labels=None):
         self.model.eval()
         reconstructions = []
+        if self.conditional and None==labels:
+            raise ValueError("model is conditional but labels not supplied during decoding")
         with torch.no_grad():
-            for vector in latent_vectors:
+            for v in range(len(latent_vectors)):
+                vector = latent_vectors[v]
+                label = labels[v]
                 mu, logvar = vector[0].to(self.device), vector[1].to(self.device)
                 z = self.model.reparameterize(mu, logvar)
-                recon = self.model.decode(z)
+                recon = self.model.decode(z, label)
                 reconstructions.append(recon)
         return torch.cat(reconstructions)
-    
-    
-    
-    
-class VAE_conditional(VAE):
-    def temp(self):
-        pass
     
