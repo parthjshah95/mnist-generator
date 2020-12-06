@@ -11,24 +11,55 @@ from tqdm import tqdm
 
 
 
-class Model_small(nn.Module):
-    def __init__(self, dct_freqs, layers):
+class Model(nn.Module):
+    def __init__(self):
         super().__init__()
-        vector_size = np.prod(dct_freqs)
-        self.fc1 = nn.Linear(vector_size, layers[0])
-        self.fc1a = nn.Linear(layers[0], layers[1])
-        self.fc21 = nn.Linear(layers[1], layers[2])
-        self.fc22 = nn.Linear(layers[1], layers[2])
-        self.fc3 = nn.Linear(layers[2], layers[1])
-        self.fc3a = nn.Linear(layers[1], layers[0])
-        self.fc4 = nn.Linear(layers[0], vector_size)
+        # 28x28x1
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=8, kernel_size=3, stride=1, padding=1)
+        # 28x28x8
+        self.conv2 = nn.Conv2d(in_channels=8, out_channels=8, kernel_size=3, stride=2, padding=1)
+        # 14x14x8
+        self.batchnorm1 = nn.BatchNorm2d(8)
+        # 14x14x8
+        self.conv3 = nn.Conv2d(in_channels=8, out_channels=16, kernel_size=3, stride=2, padding=1)
+        # 7x7x16
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=0)
+        # 3x3x16
+        self.fc1a = nn.Linear(3*3*16, 100)
+        # 100 (mu)
+        self.fc1b = nn.Linear(3*3*16, 100)
+        # 100 (var)
+        
+        self.fc2 = nn.Linear(100, 3*3*16)
+        # 3x3x16
+        self.deconv1 = nn.ConvTranspose2d(in_channels=16, out_channels=16, kernel_size=3, stride=1, padding=0, output_padding=0)
+        # 5x5x16
+        self.deconv2 = nn.ConvTranspose2d(in_channels=16, out_channels=16, kernel_size=3, stride=1, padding=0, output_padding=0)
+        # 7x7x16
+        self.batchnorm2 = nn.BatchNorm2d(16)
+        # 7x7x16
+        self.deconv3 = nn.ConvTranspose2d(in_channels=16, out_channels=8, kernel_size=3, stride=2, padding=0, output_padding=0)
+        # 15x15x8
+        self.deconv4 = nn.ConvTranspose2d(in_channels=8, out_channels=4, kernel_size=5, stride=1, padding=0, output_padding=0)
+        # 19x19x4
+        self.batchnorm3 = nn.BatchNorm2d(4)
+        # 19x19x4
+        self.deconv5 = nn.ConvTranspose2d(in_channels=4, out_channels=2, kernel_size=5, stride=1, padding=0, output_padding=0)
+        # 23x23x2
+        self.deconv6 = nn.ConvTranspose2d(in_channels=2, out_channels=1, kernel_size=5, stride=1, padding=0, output_padding=0)
+        # 27x27x1
+        # pad - 28x28x1
+        self.lastconv = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=3, stride=1, padding=1, bias=False)
 
     # ReLU are used instead of sigmoid function for faster computation
     def encode(self, x):
-        h1 = F.relu(self.fc1(x))
-        h1 = F.relu(self.fc1a(h1))
-        mu = self.fc21(h1)
-        logvar = self.fc22(h1)
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.batchnorm1(self.conv2(x)))
+        x = F.relu(self.conv3(x))
+        x = self.maxpool(x)
+        x = x.view(-1, 3*3*16)
+        mu = self.fc1a(x)
+        logvar = self.fc1b(x)
         return mu, logvar
 
     def reparameterize(self, mu, logvar):
@@ -37,9 +68,17 @@ class Model_small(nn.Module):
         return mu + eps*std
 
     def decode(self, z):
-        h3 = F.relu(self.fc3(z))
-        h3 = F.relu(self.fc3a(h3))
-        return torch.sigmoid(self.fc4(h3))
+        z = F.leaky_relu(self.fc2(z))
+        z = z.view(-1, 16, 3, 3)
+        z = F.leaky_relu(self.deconv1(z))
+        z = F.leaky_relu(self.batchnorm2(self.deconv2(z)))
+        z = F.leaky_relu(self.deconv3(z))
+        z = F.leaky_relu(self.batchnorm3(self.deconv4(z)))
+        z = F.leaky_relu(self.deconv5(z))
+        z = F.hardsigmoid(self.deconv6(z))
+        z = F.pad(z, [0,1,0,1])
+        z = self.lastconv(z)
+        return z
 
     def forward(self, x):
         mu, logvar = self.encode(x)
@@ -48,12 +87,10 @@ class Model_small(nn.Module):
 
     
     
-class VAE_small:
-    def __init__(self, dct_freqs, device, layers=[640, 320, 160]):
-        self.layers = layers
-        self.model = Model_small(dct_freqs, layers).to(device)
+class VAE:
+    def __init__(self, device):
+        self.model = Model().to(device)
         self.device = device
-        self.dct_freqs = dct_freqs
         # initialize optimizer
         # adam optimizer is used instead of adagrad for better convergence
         self.optimizer = optim.Adam(self.model.parameters(), lr=1e-3)
@@ -74,7 +111,6 @@ class VAE_small:
         self.model.train()
         train_loss_list = []
         test_loss_list = []
-        vector_size = np.prod(self.dct_freqs)
         if type(epochs) == type([]):
             min_epochs = epochs[0]
             max_epochs = epochs[1]
@@ -83,7 +119,6 @@ class VAE_small:
             max_epochs = 10*epochs
         epoch = 0
         mov_av_loss = 300
-        tqdm.write('starting training...')
         pbar = tqdm(total=max_epochs)
         while True:
             pbar.update(1)
@@ -94,8 +129,7 @@ class VAE_small:
             epoch += 1
             batch_loss = []
             for data, _ in (train_data):
-                data = data.reshape([-1, vector_size]).to(self.device)
-                assert data.size()[-1] == vector_size, "data size: "+str(data.size())
+                data = data.to(self.device)
                 self.optimizer.zero_grad()
                 recon_batch, mu, logvar = self.model(data)
                 loss = self.loss_function(recon_batch, data, mu, logvar)
@@ -109,8 +143,7 @@ class VAE_small:
             if test_data:
                 with torch.no_grad():
                     for data,_ in test_data:
-                        data = data.reshape([-1, vector_size]).to(self.device)
-                        assert data.size()[-1] == vector_size, "data size: "+str(data.size())
+                        data = data.to(self.device)
                         recon_batch, mu, logvar = self.model(data)
                         loss = self.loss_function(recon_batch, data, mu, logvar)                   
                         batch_loss_test.append(loss.cpu().numpy())
@@ -124,34 +157,40 @@ class VAE_small:
     def test(self, test_data):
         self.model.eval()
         reconstructions = []
-        vector_size = np.prod(self.dct_freqs)
         with torch.no_grad():
             for data, _ in (test_data):
-                data = data.reshape([-1, vector_size]).to(self.device)
+                data = data.to(self.device)
                 recon_batch, mu, logvar = self.model(data)
                 reconstructions.append(recon_batch.cpu().numpy())
         return reconstructions
     
     def encode(self, enc_data):
         self.model.eval()
-        vector_size = np.prod(self.dct_freqs)
-        latent_vectors = []
+        latent_vecs = []
+        self.model.eval()
         with torch.no_grad():
             for data, _ in (enc_data):
-                data = data.reshape([-1, vector_size]).to(self.device)
+                data = data.to(self.device)
                 mu, logvar = self.model.encode(data)
-                latent_vector = [mu.cpu().numpy(), logvar.cpu().numpy()]
-                latent_vectors.append(latent_vector)
-        return np.array(latent_vectors)
+                latent = torch.stack([mu, logvar]).permute(1,0,2)
+                latent_vecs.append(latent)
+        return torch.cat(latent_vecs)
     
     def decode(self, latent_vectors):
         self.model.eval()
-        vector_size = np.prod(self.dct_freqs)
         reconstructions = []
         with torch.no_grad():
             for vector in latent_vectors:
                 mu, logvar = vector[0].to(self.device), vector[1].to(self.device)
                 z = self.model.reparameterize(mu, logvar)
                 recon = self.model.decode(z)
-                reconstructions.append(recon.cpu().numpy())
-        return np.array(reconstructions)
+                reconstructions.append(recon)
+        return torch.cat(reconstructions)
+    
+    
+    
+    
+class VAE_conditional(VAE):
+    def temp(self):
+        pass
+    
